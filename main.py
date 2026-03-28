@@ -154,20 +154,25 @@ class JabraSpeak:
                     muted = False
                     global unmute_cooldown
                     unmute_cooldown = 1
+                    print("unmute cooldown")
                 else:
                     await write_to_lva(LVACommand.MUTE_MIC)
                     muted = True
             # call button
-            elif (event & Telephony.hook_switch and last_jabra_write == LEDState.default
+            elif event & Telephony.hook_switch and last_jabra_write == LEDState.default:
                   # damn thing fires the hook swicth when you unmUTE
-                  and last_lva_write != LVACommand.UNMUTE_MIC):
-                print("jabra to lva: call button detected")
-                # if lva is glitched and i dont update the state machine, it will absolutely crap out
-                await write_to_jabra(LEDState.flashing)
+                global last_lva_write
+                if last_lva_write != LVACommand.UNMUTE_MIC:
+                    print("jabra to lva: call button detected")
+                    # if lva is glitched and i dont update the state machine, it will absolutely crap out
+                    await write_to_jabra(LEDState.flashing)
 
-                await write_to_lva(LVACommand.START_LISTENING)
+                    await write_to_lva(LVACommand.START_LISTENING)
 
-                await asyncio.create_task(listening_bodge())
+                    await asyncio.create_task(listening_bodge())
+                else:
+                    # edge case: user unmutes and then hits call button
+                    last_lva_write = None
 
 
 # fixes a bug where it can get stuck on wakework detected
@@ -257,6 +262,7 @@ async def wsloop():
                             await write_to_jabra(LEDState.default)
                             global unmute_cooldown
                             unmute_cooldown = 1
+                            print("unmute cooldown")
                         case LVAEvent.MUTED:
                             muted = True
                             await write_to_jabra(LEDState.all_red)
@@ -309,6 +315,8 @@ async def mute_detect_bodge():
 
                 if unmute_cooldown > 0:
                     unmute_cooldown -= read_dur
+                    if unmute_cooldown <= 0:
+                        print("unmute cooldown finished")
 
 
         except asyncio.CancelledError:
