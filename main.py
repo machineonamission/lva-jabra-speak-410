@@ -16,16 +16,13 @@ LVA_WS_URL = os.getenv("LVA_WS_URL", "ws://192.168.0.2:6055")
 JABRA_VENDOR = 0x0b0e
 JABRA_PRODUCT = 0x0412
 
-interfaces = hid.enumerate()
-USAGE_PAGE = 11
+# interfaces = hid.enumerate()
+# USAGE_PAGE = 11
 
 devices = []
 for device in hid.enumerate(JABRA_VENDOR, JABRA_PRODUCT):
-    if device['usage_page'] in [11, 12]:
-        print("found ", device)
-
-        serial = device['serial_number']
-        devices.append(device['path'])
+    serial = device['serial_number']
+    devices.append(device['path'])
 
 
 if len(devices) == 0:
