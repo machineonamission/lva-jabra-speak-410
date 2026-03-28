@@ -29,7 +29,8 @@ for device in hid.enumerate(JABRA_VENDOR, JABRA_PRODUCT):
 
 
 if len(devices) == 0:
-    raise Exception("no jabra speak 410 found!")
+    print("NO JABRA ALERT WAAAAA")
+    # raise Exception("no jabra speak 410 found!")
 
 class Telephony(IntFlag):
     hook_switch = 1 << 0
