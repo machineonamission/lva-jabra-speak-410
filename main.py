@@ -28,6 +28,9 @@ for device in hid.enumerate(JABRA_VENDOR, JABRA_PRODUCT):
         devices.append(device['path'])
 
 
+if len(devices) == 0:
+    raise Exception("no jabra speak 410 found!")
+
 class Telephony(IntFlag):
     hook_switch = 1 << 0
     line_busy_tone = 1 << 1
