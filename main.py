@@ -150,10 +150,10 @@ class JabraSpeak:
                 print("jabra to lva: mute toggle detected")
                 global muted
                 if muted:
+                    global unmute_cooldown
                     unmute_cooldown = 1
                     await write_to_lva(LVACommand.UNMUTE_MIC)
                     muted = False
-                    global unmute_cooldown
                     print("unmute cooldown")
                 else:
                     await write_to_lva(LVACommand.MUTE_MIC)
@@ -295,6 +295,7 @@ async def mute_detect_bodge():
         print("pw-record not found. make sure wireplumber is installed.")
         return
     while True:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "pw-record", "--rate", "16000", "--channels", "1", "--format", "s16", "-",
@@ -322,6 +323,8 @@ async def mute_detect_bodge():
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            if proc:
+                proc.kill()
             print("fatal error in mute_detect_bodge: ", e)
             await asyncio.sleep(1)
 
