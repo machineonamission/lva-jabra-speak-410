@@ -283,7 +283,7 @@ async def mute_detect_bodge():
     while True:
         try:
             proc = await asyncio.create_subprocess_exec(
-                "pw-record", "--raw", "--rate", "16000", "--channels", "1", "--format", "s16", "-",
+                "pw-record", "--rate", "16000", "--channels", "1", "--format", "s16", "-",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
                 stdin=asyncio.subprocess.DEVNULL
@@ -313,8 +313,8 @@ async def main():
         for d in devices:
             tg.create_task(d.readloop())
 
-        await asyncio.sleep(0.5)
-        await write_to_jabra(LEDs.microphone | LEDs.speaker)
+        # await asyncio.sleep(0.5)
+        # await write_to_jabra(LEDs.microphone | LEDs.speaker)
 
 
 asyncio.run(main())
