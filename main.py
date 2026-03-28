@@ -22,6 +22,7 @@ print(hid.enumerate())
 devices = []
 for device in hid.enumerate(JABRA_VENDOR):
     serial = device['serial_number']
+    print(f"Found {device['product_string']} serial number: {serial}")
     devices.append(device['path'])
 
 
@@ -151,6 +152,8 @@ class JabraSpeak:
                 if muted:
                     await write_to_lva(LVACommand.UNMUTE_MIC)
                     muted = False
+                    global unmute_cooldown
+                    unmute_cooldown = 1
                 else:
                     await write_to_lva(LVACommand.MUTE_MIC)
                     muted = True
@@ -178,6 +181,8 @@ last_jabra_write: LEDs | LEDState = LEDState.default
 last_lva_write: LVACommand | None = None
 devices = [JabraSpeak(d) for d in devices]
 
+
+unmute_cooldown = 0
 
 async def write_to_jabra(state: LEDs | LEDState):
     print(f"to jabra: {state.name} {int(state):b}")
@@ -250,6 +255,8 @@ async def wsloop():
                         case LVAEvent.IDLE:
                             muted = False
                             await write_to_jabra(LEDState.default)
+                            global unmute_cooldown
+                            unmute_cooldown = 1
                         case LVAEvent.MUTED:
                             muted = True
                             await write_to_jabra(LEDState.all_red)
@@ -290,13 +297,18 @@ async def mute_detect_bodge():
                 stdin=asyncio.subprocess.DEVNULL
             )
             while True:
-                chunk = await proc.stdout.readexactly(6400)
-                global muted
+                rate = 16_000
+                read_dur = 0.2
+                chunk = await proc.stdout.readexactly(int(rate*read_dur))
+                global muted, unmute_cooldown
                 # all zeroes, mic has been muted
-                if not any(chunk) and not muted:
+                if not any(chunk) and not muted and unmute_cooldown <= 0:
                     muted = True
                     await write_to_lva(LVACommand.MUTE_MIC)
                     await write_to_jabra(LEDs.mute)
+
+                if unmute_cooldown > 0:
+                    unmute_cooldown -= read_dur
 
 
         except asyncio.CancelledError:
