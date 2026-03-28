@@ -128,6 +128,8 @@ class JabraSpeak:
         return await asyncio.to_thread(self.device.write, [0x03, button_state & 0xff, (button_state & 0xff00) >> 8])
 
     async def readloop(self):
+        global unmute_cooldown
+
         while True:
             event = await self.read()
             print(f"from jabra: {event.name} {int(event):b}")
@@ -161,8 +163,7 @@ class JabraSpeak:
             # call button
             elif event & Telephony.hook_switch and last_jabra_write == LEDState.default:
                   # damn thing fires the hook swicth when you unmUTE
-                global last_lva_write
-                if last_lva_write != LVACommand.UNMUTE_MIC:
+                if unmute_cooldown > 0:
                     print("jabra to lva: call button detected")
                     # if lva is glitched and i dont update the state machine, it will absolutely crap out
                     await write_to_jabra(LEDState.flashing)
@@ -170,9 +171,6 @@ class JabraSpeak:
                     await write_to_lva(LVACommand.START_LISTENING)
 
                     await asyncio.create_task(listening_bodge())
-                else:
-                    # edge case: user unmutes and then hits call button
-                    last_lva_write = None
 
 
 # fixes a bug where it can get stuck on wakework detected
