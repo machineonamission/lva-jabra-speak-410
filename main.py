@@ -291,9 +291,11 @@ async def mute_detect_bodge():
             while True:
                 chunk = await proc.stdout.readexactly(6400)
                 global muted
+                # all zeroes, mic has been muted
                 if not any(chunk) and not muted:
                     muted = True
                     await write_to_lva(LVACommand.MUTE_MIC)
+                    await write_to_jabra(LEDs.mute)
 
 
         except asyncio.CancelledError:
