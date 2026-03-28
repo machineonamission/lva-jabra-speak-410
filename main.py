@@ -150,10 +150,10 @@ class JabraSpeak:
                 print("jabra to lva: mute toggle detected")
                 global muted
                 if muted:
+                    unmute_cooldown = 1
                     await write_to_lva(LVACommand.UNMUTE_MIC)
                     muted = False
                     global unmute_cooldown
-                    unmute_cooldown = 1
                     print("unmute cooldown")
                 else:
                     await write_to_lva(LVACommand.MUTE_MIC)
@@ -259,9 +259,9 @@ async def wsloop():
                             asyncio.create_task(cool_error())
                         case LVAEvent.IDLE:
                             muted = False
-                            await write_to_jabra(LEDState.default)
                             global unmute_cooldown
                             unmute_cooldown = 1
+                            await write_to_jabra(LEDState.default)
                             print("unmute cooldown")
                         case LVAEvent.MUTED:
                             muted = True
