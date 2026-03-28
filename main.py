@@ -14,13 +14,13 @@ from websockets import ClientConnection
 LVA_WS_URL = os.getenv("LVA_WS_URL", "ws://192.168.0.2:6055")
 
 JABRA_VENDOR = 0x0b0e
-JABRA_PRODUCT = 0x0412
+# JABRA_PRODUCT = 0x0412
 
-# interfaces = hid.enumerate()
+print(hid.enumerate())
 # USAGE_PAGE = 11
 
 devices = []
-for device in hid.enumerate(JABRA_VENDOR, JABRA_PRODUCT):
+for device in hid.enumerate(JABRA_VENDOR):
     serial = device['serial_number']
     devices.append(device['path'])
 
