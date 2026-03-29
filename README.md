@@ -37,7 +37,11 @@ the same machine and ports are exposed
 this image mostly relies on [`hidapi`](https://pypi.org/project/hidapi/) to read/write LEDs/buttons, which means you
 need to add `/dev/bus/usb` as a device
 
-### pipewire volume control
+### pipewire
+
+optionally set the env var `PW_SINK` to use a different pipewire sink than the system default
+
+#### volume control
 
 this isn't exactly intended behavior, but it seems `hidapi` takes full control of the USB HID stuff. this repo provides
 volume control as well, but it's disabled by default. this means things like
@@ -50,8 +54,9 @@ well with  [pipewire volume control (#272)](https://github.com/OHF-Voice/linux-v
 to send LVA
 volume commands (WARNING: be careful with this so that your system isn't recieving two volume down events, or the
 internal volume controls aren't kicking in, resulting in multiple stacking volume down)
+- any other value, including the default, will result in ignoring volume button presses
 
-### mute button pipewire bodge
+#### mute button bodge
 
 the jabra speak is weird and currently i haven't found a way to detect the mute _button_ when the device doesn't think
 it's in a call. BUT, you can expose pipewire to the container and it can read the mic, listen for all

@@ -414,6 +414,7 @@ async def mute_detect_bodge():
                     muted = False
                     await write_to_lva(LVACommand.UNMUTE_MIC)
                     await write_to_jabra(LEDs.mute)
+                    unmute_cooldown = 1
 
                 if unmute_cooldown > 0:
                     unmute_cooldown -= read_dur
