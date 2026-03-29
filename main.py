@@ -27,8 +27,8 @@ for device in hid.enumerate(JABRA_VENDOR):
 
 
 if len(devices) == 0:
-    print("NO JABRA ALERT WAAAAA")
-    # raise Exception("no jabra speak 410 found!")
+    # print("NO JABRA ALERT WAAAAA")
+    raise Exception("no jabra speak 410 found!")
 
 class Telephony(IntFlag):
     hook_switch = 1 << 0
@@ -322,7 +322,10 @@ async def mute_detect_bodge():
             raise
         except Exception as e:
             if proc:
-                proc.kill()
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
             print("fatal error in mute_detect_bodge: ", e)
             await asyncio.sleep(1)
 
