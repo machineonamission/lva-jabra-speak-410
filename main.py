@@ -391,7 +391,7 @@ async def pw_vol():
 def off_mute_cooldown():
     global last_mute
     ret = time.perf_counter() - last_mute >= 1
-    print("on mute cooldown: ", ret)
+    print("off mute cooldown: ", ret)
     return ret
 
 
