@@ -151,7 +151,7 @@ class JabraSpeak:
         return await asyncio.to_thread(self.device.write, [0x03, button_state & 0xff, (button_state & 0xff00) >> 8])
 
     async def readloop(self):
-        global unmute_cooldown, muted
+        global last_mute, muted
 
         while True:
             event = await self.read()
@@ -181,7 +181,7 @@ class JabraSpeak:
                 # call button
                 elif event & Telephony.hook_switch and last_jabra_write == LEDState.default:
                     # damn thing fires the hook swicth when you unmUTE
-                    if unmute_cooldown <= 0:
+                    if last_mute <= 0:
                         print("jabra to lva: call button detected")
                         # if lva is glitched and i dont update the state machine, it will absolutely crap out
                         await write_to_jabra(LEDState.flashing)
@@ -228,7 +228,7 @@ last_jabra_write: LEDs | LEDState = LEDState.default
 last_lva_write: LVACommand | None = None
 devices = [JabraSpeak(d) for d in devices]
 
-unmute_cooldown = 0
+last_mute = 0
 
 
 def bytelist(l: list[int]):
@@ -257,10 +257,9 @@ lva_sock: None | ClientConnection = None
 
 
 async def set_mute(m: bool, write_lva: bool = True):
-    global muted, unmute_cooldown
+    global muted, last_mute
     muted = m
-    unmute_cooldown = 1
-    print("unmute cooldown = 1")
+    mute_cooldown()
     if m:
         commands = [await write_to_jabra(LEDState.all_red)] + \
                    [await write_to_lva(LVACommand.MUTE_MIC)] if write_lva else []
@@ -388,6 +387,16 @@ async def pw_vol():
     match = re.search(r'Volume:\s*([0-9.]+)', stdout)
     return float(match.group(1))  # Returns exactly 0.5
 
+def off_mute_cooldown():
+    global last_mute
+    return time.perf_counter() - last_mute >= 1
+
+
+def mute_cooldown():
+    global last_mute
+    print("mute_cooldown")
+    last_mute = time.perf_counter()
+
 
 async def mute_detect_bodge():
     if shutil.which("pw-record") is None:
@@ -406,17 +415,12 @@ async def mute_detect_bodge():
                 rate = 16_000
                 read_dur = 0.2
                 chunk = await proc.stdout.readexactly(int(rate * read_dur))
-                global muted, unmute_cooldown
+                global muted, last_mute
                 # all zeroes, mic has been muted
-                if not any(chunk) and not muted and unmute_cooldown <= 0:
+                if not any(chunk) and not muted and off_mute_cooldown():
                     await set_mute(True)
-                if any(chunk) and muted and unmute_cooldown <= 0:
+                if any(chunk) and muted and off_mute_cooldown():
                     await set_mute(False)
-
-                if unmute_cooldown > 0:
-                    unmute_cooldown -= read_dur
-                    if unmute_cooldown <= 0:
-                        print("unmute cooldown finished")
 
 
         except asyncio.CancelledError:
