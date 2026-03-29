@@ -25,10 +25,10 @@ for device in hid.enumerate(JABRA_VENDOR):
     print(f"Found {device['product_string']} serial number: {serial}")
     devices.append(device['path'])
 
-
 if len(devices) == 0:
     # print("NO JABRA ALERT WAAAAA")
     raise Exception("no jabra speak 410 found!")
+
 
 class Telephony(IntFlag):
     hook_switch = 1 << 0
@@ -55,6 +55,13 @@ class LEDs(IntFlag):
     microphone = 1 << 5
     # marked telephony and not LED, probably why it's a dupe of ring
     ringer = 1 << 6
+
+
+class Volume(IntFlag):
+    vol_down = 1 << 0
+    vol_up = 1 << 1
+    # does this ever trigger? might be a host -> device only thing?
+    mute = 1 << 2
 
 
 class LEDState(IntFlag, Enum):
@@ -113,10 +120,14 @@ class JabraSpeak:
             try:
                 read_info = self.device.read(8)
                 if read_info:
-                    if read_info[0] == 0x03:
-                        return Telephony(read_info[1] | read_info[2] << 8)
-                    else:
-                        print(f"Packet {read_info} of unknown type")
+                    match read_info[0]:
+                        case 0x03:
+                            return Telephony(read_info[1] | read_info[2] << 8)
+                        case 0x01:
+                            return Volume(read_info[1])
+                        case _:
+                            print(f"Packet {read_info} of unknown type")
+
                 await asyncio.sleep(0.1)
             except asyncio.CancelledError:
                 raise
@@ -128,49 +139,78 @@ class JabraSpeak:
         return await asyncio.to_thread(self.device.write, [0x03, button_state & 0xff, (button_state & 0xff00) >> 8])
 
     async def readloop(self):
-        global unmute_cooldown
+        global unmute_cooldown, muted
 
         while True:
             event = await self.read()
-            print(f"from jabra: {event.name} {int(event):b}")
+            print(f"from jabra: {event.__class__.__name__} {event.name} 0b{int(event):b}")
             # print(f"last event: {last_jabra_write.name}")
+            if isinstance(event, Telephony):
+                if (
+                        # hangup while talking
+                        ((event & Telephony.flash) and last_jabra_write == LEDState.partial_flash)
+                        # hangup while listening
+                        or (event is None and last_jabra_write == LEDState.three_green)
+                        # hangup while flashing?? wtf is button 7????
+                        or (event & Telephony.button_7)
+                ):
+                    print("jabra to lva: hangup detected")
+                    await write_to_lva(LVACommand.STOP_TIMER_RINGING)
+                    await write_to_lva(LVACommand.STOP_SPEAKING)
+                    await write_to_lva(LVACommand.STOP_LISTENING)
+                # mute switch
+                elif event & Telephony.mute:
+                    print("jabra to lva: mute toggle detected")
+                    global muted
+                    if muted:
+                        global unmute_cooldown
+                        unmute_cooldown = 1
+                        await write_to_lva(LVACommand.UNMUTE_MIC)
+                        muted = False
+                        print("unmute cooldown")
+                    else:
+                        await write_to_lva(LVACommand.MUTE_MIC)
+                        muted = True
+                # call button
+                elif event & Telephony.hook_switch and last_jabra_write == LEDState.default:
+                    # damn thing fires the hook swicth when you unmUTE
+                    if unmute_cooldown <= 0:
+                        print("jabra to lva: call button detected")
+                        # if lva is glitched and i dont update the state machine, it will absolutely crap out
+                        await write_to_jabra(LEDState.flashing)
 
-            if (
-                    # hangup while talking
-                    ((event & Telephony.flash) and last_jabra_write == LEDState.partial_flash)
-                    # hangup while listening
-                    or (event is None and last_jabra_write == LEDState.three_green)
-                    # hangup while flashing?? wtf is button 7????
-                    or (event & Telephony.button_7)
-            ):
-                print("jabra to lva: hangup detected")
-                await write_to_lva(LVACommand.STOP_TIMER_RINGING)
-                await write_to_lva(LVACommand.STOP_SPEAKING)
-                await write_to_lva(LVACommand.STOP_LISTENING)
-            # mute switch
-            elif event & Telephony.mute:
-                print("jabra to lva: mute toggle detected")
-                global muted
-                if muted:
-                    global unmute_cooldown
-                    unmute_cooldown = 1
-                    await write_to_lva(LVACommand.UNMUTE_MIC)
-                    muted = False
-                    print("unmute cooldown")
-                else:
-                    await write_to_lva(LVACommand.MUTE_MIC)
-                    muted = True
-            # call button
-            elif event & Telephony.hook_switch and last_jabra_write == LEDState.default:
-                  # damn thing fires the hook swicth when you unmUTE
-                if unmute_cooldown <= 0:
-                    print("jabra to lva: call button detected")
-                    # if lva is glitched and i dont update the state machine, it will absolutely crap out
-                    await write_to_jabra(LEDState.flashing)
+                        await write_to_lva(LVACommand.START_LISTENING)
 
-                    await write_to_lva(LVACommand.START_LISTENING)
-
-                    await asyncio.create_task(listening_bodge())
+                        await asyncio.create_task(listening_bodge())
+            elif isinstance(event, Volume):
+                vol_ctrl = os.getenv("VOLUME_CONTROL", "none")
+                if vol_ctrl not in ["lva", "pipewire"]:
+                    print("ignoring volume command, env not set")
+                    continue
+                if event & Volume.vol_up:
+                    print("jabra to lva: volume up detected")
+                    match vol_ctrl:
+                        case "lva":
+                            await write_to_lva(LVACommand.VOLUME_UP)
+                        case "pipewire":
+                            await wpctl_vol("8.333%+")
+                elif event & Volume.vol_down:
+                    print("jabra to lva: volume down detected")
+                    match vol_ctrl:
+                        case "lva":
+                            await write_to_lva(LVACommand.VOLUME_DOWN)
+                        case "pipewire":
+                            await wpctl_vol("8.333%-")
+                elif event & Volume.mute:
+                    print("jabra to lva: consumer control mute toggle detected")
+                    if muted:
+                        unmute_cooldown = 1
+                        await write_to_lva(LVACommand.UNMUTE_MIC)
+                        muted = False
+                        print("unmute cooldown")
+                    else:
+                        await write_to_lva(LVACommand.MUTE_MIC)
+                        muted = True
 
 
 # fixes a bug where it can get stuck on wakework detected
@@ -180,12 +220,13 @@ async def listening_bodge():
         await write_to_lva(LVACommand.STOP_LISTENING)
         await write_to_jabra(LEDState.three_green)
 
+
 last_jabra_write: LEDs | LEDState = LEDState.default
 last_lva_write: LVACommand | None = None
 devices = [JabraSpeak(d) for d in devices]
 
-
 unmute_cooldown = 0
+
 
 async def write_to_jabra(state: LEDs | LEDState):
     print(f"to jabra: {state.name} {int(state):b}")
@@ -219,6 +260,20 @@ async def cool_error():
 current_state: None | LVAEvent = None
 
 muted: bool = False
+
+
+async def wpctl_vol(vol_mod: str):
+    cmd = ["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_SINK@", vol_mod]
+    print("wpctl_vol: cmd ", cmd)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise Exception("wpctl failed ", cmd, stdout, stderr)
 
 
 async def wsloop():
@@ -298,13 +353,13 @@ async def mute_detect_bodge():
             proc = await asyncio.create_subprocess_exec(
                 "pw-record", "--rate", "16000", "--channels", "1", "--format", "s16", "-",
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.DEVNULL
             )
             while True:
                 rate = 16_000
                 read_dur = 0.2
-                chunk = await proc.stdout.readexactly(int(rate*read_dur))
+                chunk = await proc.stdout.readexactly(int(rate * read_dur))
                 global muted, unmute_cooldown
                 # all zeroes, mic has been muted
                 if not any(chunk) and not muted and unmute_cooldown <= 0:
@@ -320,6 +375,11 @@ async def mute_detect_bodge():
 
         except asyncio.CancelledError:
             raise
+        except asyncio.IncompleteReadError as e:
+            # This happens when pw-record is killed while waiting for data. Just exit the loop and respawn it.
+            print("pw-record process ended ", e)
+            print(await proc.communicate())
+            print(proc.returncode)
         except Exception as e:
             if proc:
                 try:
