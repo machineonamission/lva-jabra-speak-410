@@ -11,7 +11,7 @@ from websockets import ClientConnection
 
 # --- CONFIGURATION ---
 # Default to localhost if running on host network, or use LVA container name/IP
-LVA_WS_URL = os.getenv("LVA_WS_URL", "ws://192.168.0.2:6055")
+LVA_WS_URL = os.getenv("LVA_WS_URL", "ws://0.0.0.0:6055")
 
 JABRA_VENDOR = 0x0b0e
 # JABRA_PRODUCT = 0x0412
