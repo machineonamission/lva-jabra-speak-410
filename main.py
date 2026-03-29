@@ -175,14 +175,9 @@ class JabraSpeak:
                     print("jabra to lva: mute toggle detected")
                     global muted
                     if muted:
-                        global unmute_cooldown
-                        unmute_cooldown = 1
-                        await write_to_lva(LVACommand.UNMUTE_MIC)
-                        muted = False
-                        print("unmute cooldown")
+                        await set_mute(False)
                     else:
-                        await write_to_lva(LVACommand.MUTE_MIC)
-                        muted = True
+                        await set_mute(True)
                 # call button
                 elif event & Telephony.hook_switch and last_jabra_write == LEDState.default:
                     # damn thing fires the hook swicth when you unmUTE
@@ -215,13 +210,10 @@ class JabraSpeak:
                 elif event & Volume.mute:
                     print("jabra to lva: consumer control mute toggle detected")
                     if muted:
-                        unmute_cooldown = 1
-                        await write_to_lva(LVACommand.UNMUTE_MIC)
-                        muted = False
+                        await set_mute(False)
                         print("unmute cooldown")
                     else:
-                        await write_to_lva(LVACommand.MUTE_MIC)
-                        muted = True
+                        await set_mute(True)
 
 
 # fixes a bug where it can get stuck on wakework detected
@@ -262,6 +254,24 @@ async def write_to_lva(command: LVACommand, data: dict = None):
 
 
 lva_sock: None | ClientConnection = None
+
+
+async def set_mute(m: bool, write_lva: bool = True):
+    global muted, unmute_cooldown
+    muted = m
+    unmute_cooldown = 1
+    print("unmute cooldown = 1")
+    if m:
+        commands = [await write_to_jabra(LEDState.all_red)] + \
+                   [await write_to_lva(LVACommand.MUTE_MIC)] if write_lva else []
+
+        await asyncio.gather(*commands)
+
+    else:
+        commands = [await write_to_jabra(LEDState.default)] + \
+                   [await write_to_lva(LVACommand.UNMUTE_MIC)] if write_lva else []
+
+        await asyncio.gather(*commands)
 
 
 async def cool_error():
@@ -324,10 +334,7 @@ async def wsloop():
                     print(f"from lva: {data}")
                     json_data = json.loads(data)
                     if json_data["event"] == "snapshot":
-                        global muted
-                        muted = json_data["data"]["muted"]
-                        if muted:
-                            await write_to_jabra(LEDState.all_red)
+                        await set_mute(json_data["data"]["muted"], write_lva=False)
                     global current_state
                     try:
                         current_state = LVAEvent(json_data["event"])
@@ -347,14 +354,9 @@ async def wsloop():
                         case LVAEvent.ERROR:
                             asyncio.create_task(cool_error())
                         case LVAEvent.IDLE:
-                            muted = False
-                            global unmute_cooldown
-                            unmute_cooldown = 1
-                            await write_to_jabra(LEDState.default)
-                            print("unmute cooldown")
+                            await set_mute(False, write_lva=False)
                         case LVAEvent.MUTED:
-                            muted = True
-                            await write_to_jabra(LEDState.all_red)
+                            await set_mute(True, write_lva=False)
                         case LVAEvent.TIMER_TICKING:
                             pass
                         case LVAEvent.TIMER_UPDATED:
@@ -407,14 +409,9 @@ async def mute_detect_bodge():
                 global muted, unmute_cooldown
                 # all zeroes, mic has been muted
                 if not any(chunk) and not muted and unmute_cooldown <= 0:
-                    muted = True
-                    await write_to_lva(LVACommand.MUTE_MIC)
-                    await write_to_jabra(LEDs.mute)
-                if any(chunk) and muted:
-                    muted = False
-                    await write_to_lva(LVACommand.UNMUTE_MIC)
-                    await write_to_jabra(LEDs.mute)
-                    unmute_cooldown = 1
+                    await set_mute(True)
+                if any(chunk) and muted and unmute_cooldown <= 0:
+                    await set_mute(False)
 
                 if unmute_cooldown > 0:
                     unmute_cooldown -= read_dur
