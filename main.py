@@ -1,5 +1,7 @@
 import asyncio
+import re
 import shutil
+import time
 from enum import IntFlag, Enum
 
 import websockets
@@ -15,6 +17,16 @@ LVA_WS_URL = os.getenv("LVA_WS_URL", "ws://0.0.0.0:6055")
 
 JABRA_VENDOR = 0x0b0e
 # JABRA_PRODUCT = 0x0412
+
+starttime = time.time()
+
+pw_sink = os.getenv("PW_SINK", "@DEFAULT_SINK@")
+
+vol_ctrl = os.getenv("VOLUME_CONTROL", None)
+
+if vol_ctrl not in ["pipewire", "lva"]:
+    print("invalid volume control")
+    vol_ctrl = None
 
 print(hid.enumerate())
 # USAGE_PAGE = 11
@@ -126,7 +138,7 @@ class JabraSpeak:
                         case 0x01:
                             return Volume(read_info[1])
                         case _:
-                            print(f"Packet {read_info} of unknown type")
+                            print(f"{round(time.time() - starttime, 1)}s: Packet {bytelist(read_info)} of unknown type")
 
                 await asyncio.sleep(0.1)
             except asyncio.CancelledError:
@@ -183,8 +195,7 @@ class JabraSpeak:
 
                         await asyncio.create_task(listening_bodge())
             elif isinstance(event, Volume):
-                vol_ctrl = os.getenv("VOLUME_CONTROL", "none")
-                if vol_ctrl not in ["lva", "pipewire"]:
+                if not vol_ctrl:
                     print("ignoring volume command, env not set")
                     continue
                 if event & Volume.vol_up:
@@ -228,6 +239,10 @@ devices = [JabraSpeak(d) for d in devices]
 unmute_cooldown = 0
 
 
+def bytelist(l: list[int]):
+    return "[" + ', '.join(f"0x{b:02x}" for b in l) + "]"
+
+
 async def write_to_jabra(state: LEDs | LEDState):
     print(f"to jabra: {state.name} {int(state):b}")
     global last_jabra_write
@@ -262,18 +277,39 @@ current_state: None | LVAEvent = None
 muted: bool = False
 
 
-async def wpctl_vol(vol_mod: str):
-    cmd = ["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_SINK@", vol_mod]
-    print("wpctl_vol: cmd ", cmd)
+async def run_cmd(cmd: list[str]):
+    print("run_cmd ", cmd)
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
     )
 
     stdout, stderr = await proc.communicate()
+
+    try:
+        stdout = stdout.decode().strip()
+        stderr = stderr.decode().strip()
+    except UnicodeDecodeError:
+        stdout = stdout.decode("ascii", 'ignore').strip()
+        stderr = stderr.decode("ascii", 'ignore').strip()
+
     if proc.returncode != 0:
         raise Exception("wpctl failed ", cmd, stdout, stderr)
+    else:
+        return stdout, stderr
+
+
+async def wpctl_vol(vol_mod: str):
+    await run_cmd(["wpctl", "set-volume", "-l", "1.0", pw_sink, vol_mod])
+
+    vol = await pw_vol()
+    if vol <= 0:
+        await run_cmd(["wpctl", "set-mute", pw_sink, "1"])
+    else:
+        await run_cmd(["wpctl", "set-mute", pw_sink, "0"])
 
 
 async def wsloop():
@@ -343,6 +379,14 @@ async def wsloop():
             await asyncio.sleep(1)
 
 
+async def pw_vol():
+    stdout, stderr = await run_cmd(["wpctl", "get-volume", pw_sink])
+
+    # Extract the float value
+    match = re.search(r'Volume:\s*([0-9.]+)', stdout)
+    return float(match.group(1))  # Returns exactly 0.5
+
+
 async def mute_detect_bodge():
     if shutil.which("pw-record") is None:
         print("pw-record not found. make sure wireplumber is installed.")
@@ -365,6 +409,10 @@ async def mute_detect_bodge():
                 if not any(chunk) and not muted and unmute_cooldown <= 0:
                     muted = True
                     await write_to_lva(LVACommand.MUTE_MIC)
+                    await write_to_jabra(LEDs.mute)
+                if any(chunk) and muted:
+                    muted = False
+                    await write_to_lva(LVACommand.UNMUTE_MIC)
                     await write_to_jabra(LEDs.mute)
 
                 if unmute_cooldown > 0:
@@ -393,8 +441,8 @@ async def mute_detect_bodge():
 async def main():
     async with asyncio.TaskGroup() as tg:
         # Spawn your infinite loops here
-        tg.create_task(wsloop())
-        tg.create_task(mute_detect_bodge())
+        # tg.create_task(wsloop())
+        # tg.create_task(mute_detect_bodge())
 
         # tg.create_task(block_test())
         for d in devices:
