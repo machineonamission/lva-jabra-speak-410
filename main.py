@@ -261,14 +261,14 @@ async def set_mute(m: bool, write_lva: bool = True):
     muted = m
     mute_cooldown()
     if m:
-        commands = [await write_to_jabra(LEDState.all_red)] + \
-                   [await write_to_lva(LVACommand.MUTE_MIC)] if write_lva else []
+        commands = ([write_to_jabra(LEDState.all_red)] +
+                    ([write_to_lva(LVACommand.MUTE_MIC)] if write_lva else []))
 
         await asyncio.gather(*commands)
 
     else:
-        commands = [await write_to_jabra(LEDState.default)] + \
-                   [await write_to_lva(LVACommand.UNMUTE_MIC)] if write_lva else []
+        commands = ([write_to_jabra(LEDState.default)] +
+                    ([write_to_lva(LVACommand.UNMUTE_MIC)] if write_lva else []))
 
         await asyncio.gather(*commands)
 
@@ -387,14 +387,17 @@ async def pw_vol():
     match = re.search(r'Volume:\s*([0-9.]+)', stdout)
     return float(match.group(1))  # Returns exactly 0.5
 
+
 def off_mute_cooldown():
     global last_mute
-    return time.perf_counter() - last_mute >= 1
+    ret = time.perf_counter() - last_mute >= 1
+    print("on mute cooldown: ", ret)
+    return ret
 
 
 def mute_cooldown():
     global last_mute
-    print("mute_cooldown")
+    print("set mute cooldown")
     last_mute = time.perf_counter()
 
 
