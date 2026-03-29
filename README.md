@@ -37,10 +37,17 @@ the same machine and ports are exposed
 this image mostly relies on [`hidapi`](https://pypi.org/project/hidapi/) to read/write LEDs/buttons, which means you
 need to add `/dev/bus/usb` as a device
 
+### pipewire volume control
+
 this isn't exactly intended behavior, but it seems `hidapi` takes full control of the USB HID stuff. this repo provides
-volume control as well, but it's disabled by default.
-the env var `VOLUME_CONTROLLER` sets this. set it to `pipewire` to make it mod pipewire volume on button presses (works
-well with [`alsa_volume_from_usb_hid`](https://github.com/neildavis/alsa_volume_from_usb_hid)). set to `lva` to send LVA
+volume control as well, but it's disabled by default. this means things like
+[`alsa_volume_from_usb_hid`](https://github.com/neildavis/alsa_volume_from_usb_hid) will break.
+
+the env var `VOLUME_CONTROLLER` sets this. 
+- set it to `pipewire` to make it mod pipewire volume on button presses (works
+well with  [pipewire volume control (#272)](https://github.com/OHF-Voice/linux-voice-assistant/pull/272)). 
+- set to `lva`
+to send LVA
 volume commands (WARNING: be careful with this so that your system isn't recieving two volume down events, or the
 internal volume controls aren't kicking in, resulting in multiple stacking volume down)
 

@@ -204,14 +204,14 @@ class JabraSpeak:
                         case "lva":
                             await write_to_lva(LVACommand.VOLUME_UP)
                         case "pipewire":
-                            await wpctl_vol("8.333%+")
+                            await wpctl_vol("10%+")
                 elif event & Volume.vol_down:
                     print("jabra to lva: volume down detected")
                     match vol_ctrl:
                         case "lva":
                             await write_to_lva(LVACommand.VOLUME_DOWN)
                         case "pipewire":
-                            await wpctl_vol("8.333%-")
+                            await wpctl_vol("10%-")
                 elif event & Volume.mute:
                     print("jabra to lva: consumer control mute toggle detected")
                     if muted:
@@ -441,8 +441,8 @@ async def mute_detect_bodge():
 async def main():
     async with asyncio.TaskGroup() as tg:
         # Spawn your infinite loops here
-        # tg.create_task(wsloop())
-        # tg.create_task(mute_detect_bodge())
+        tg.create_task(wsloop())
+        tg.create_task(mute_detect_bodge())
 
         # tg.create_task(block_test())
         for d in devices:
