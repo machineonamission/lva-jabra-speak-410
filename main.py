@@ -181,7 +181,7 @@ class JabraSpeak:
                 # call button
                 elif event & Telephony.hook_switch and last_jabra_write == LEDState.default:
                     # damn thing fires the hook swicth when you unmUTE
-                    if last_mute <= 0:
+                    if off_mute_cooldown():
                         print("jabra to lva: call button detected")
                         # if lva is glitched and i dont update the state machine, it will absolutely crap out
                         await write_to_jabra(LEDState.flashing)
