@@ -1,6 +1,6 @@
 # LVA + Jabra Speak 410
 
-![demo.mp4](demo.mp4)
+https://github.com/user-attachments/assets/edbfcc84-8e09-4f04-b039-65113ec8f7ae
 
 ## NOTE
 
