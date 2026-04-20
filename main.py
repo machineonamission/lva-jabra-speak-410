@@ -251,7 +251,7 @@ def discover(tg: asyncio.TaskGroup):
             del devices[path]
     for path, device in new_device_paths.items():
         if path not in device_paths:
-            print(f"New device: {path} {device['product_string']} s/n {device['serial_number']} @ {path} ")
+            print(f"New device: {device['product_string']} s/n {device['serial_number']} @ {path} ")
             devices[path] = JabraSpeak(path)
             devices[path].loop = tg.create_task(devices[path].readloop())
     device_paths = new_device_paths
