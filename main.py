@@ -2,6 +2,7 @@ import asyncio
 import re
 import shutil
 import time
+import traceback
 from enum import IntFlag, Enum
 
 import websockets
@@ -29,17 +30,9 @@ if vol_ctrl not in ["pipewire", "lva"]:
     vol_ctrl = None
 
 print(hid.enumerate())
+
+
 # USAGE_PAGE = 11
-
-devices = []
-for device in hid.enumerate(JABRA_VENDOR):
-    serial = device['serial_number']
-    print(f"Found {device['product_string']} serial number: {serial}")
-    devices.append(device['path'])
-
-if len(devices) == 0:
-    # print("NO JABRA ALERT WAAAAA")
-    raise Exception("no jabra speak 410 found!")
 
 
 class Telephony(IntFlag):
@@ -120,12 +113,19 @@ class LVACommand(str, Enum):
 
 
 class JabraSpeak:
+    loop: asyncio.Task
+
     def __init__(self, path):
         self.path = path
         self.device = hid.device()
         self.device.open_path(self.path)
         # we can do thread fuckery to make this work
         self.device.set_nonblocking(True)
+
+    def close(self):
+        if self.loop:
+            self.loop.cancel()
+        self.device.close()
 
     async def read(self):
         while True:
@@ -145,6 +145,8 @@ class JabraSpeak:
                 raise
             except Exception as e:
                 print("fatal error in jabra loop: ", e)
+                traceback.print_exc()
+
                 await asyncio.sleep(1)
 
     async def write(self, button_state: LEDs):
@@ -226,7 +228,34 @@ async def listening_bodge():
 
 last_jabra_write: LEDs | LEDState = LEDState.default
 last_lva_write: LVACommand | None = None
-devices = [JabraSpeak(d) for d in devices]
+
+device_paths = {}
+devices: dict[str, JabraSpeak] = {}
+
+
+def discover(tg: asyncio.TaskGroup):
+    global devices, device_paths
+    new_device_paths = {}
+    for device in hid.enumerate(JABRA_VENDOR):
+        # serial = device['serial_number']
+        # print(f"Found {device['product_string']} serial number: {serial}")
+        new_device_paths[device['path']] = device
+
+    if len(new_device_paths) == 0:
+        # print("NO JABRA ALERT WAAAAA")
+        print("no jabra speak found!")
+    for path, device in device_paths.items():
+        if path not in new_device_paths:
+            print(f"Device removed: {device['product_string']} s/n {device['serial_number']} @ {path}")
+            devices[path].close()
+            del devices[path]
+    for path, device in new_device_paths.items():
+        if path not in device_paths:
+            print(f"New device: {path} {device['product_string']} s/n {device['serial_number']} @ {path} ")
+            devices[path] = JabraSpeak(path)
+            devices[path].loop = tg.create_task(devices[path].readloop())
+    device_paths = new_device_paths
+
 
 last_mute = 0
 
@@ -239,7 +268,7 @@ async def write_to_jabra(state: LEDs | LEDState):
     print(f"to jabra: {state.name} {int(state):b}")
     global last_jabra_write
     last_jabra_write = state
-    return await asyncio.gather(*[d.write(state) for d in devices])
+    return await asyncio.gather(*[d.write(state) for d in devices.values()])
 
 
 async def write_to_lva(command: LVACommand, data: dict = None):
@@ -376,6 +405,7 @@ async def wsloop():
             raise
         except Exception as e:
             print("fatal error in lva loop: ", e)
+            traceback.print_exc()
             lva_sock = None
             await asyncio.sleep(1)
 
@@ -440,18 +470,28 @@ async def mute_detect_bodge():
                 except ProcessLookupError:
                     pass
             print("fatal error in mute_detect_bodge: ", e)
+            traceback.print_exc()
             await asyncio.sleep(1)
+
+
+async def discover_loop(tg: asyncio.TaskGroup):
+    while True:
+        try:
+            discover(tg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("fatal exception in discover loop ", e, str(e.__traceback__))
+            traceback.print_exc()
+        await asyncio.sleep(1)
 
 
 async def main():
     async with asyncio.TaskGroup() as tg:
         # Spawn your infinite loops here
+        tg.create_task(discover_loop(tg))
         tg.create_task(wsloop())
         tg.create_task(mute_detect_bodge())
-
-        # tg.create_task(block_test())
-        for d in devices:
-            tg.create_task(d.readloop())
 
         # await asyncio.sleep(0.5)
         # await write_to_jabra(LEDs.microphone | LEDs.speaker)
