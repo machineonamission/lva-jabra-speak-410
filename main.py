@@ -1,41 +1,72 @@
+#!/usr/bin/env python3
+"""Jabra Speak 410 peripheral controller for the Linux Voice Assistant (LVA).
+
+Runs alongside the LVA container. Connects to the Jabra Speak 410 over USB HID,
+drives its LED ring to reflect the assistant state, and maps its hardware buttons
+to the LVA peripheral API (see OHF-Voice/linux-voice-assistant
+``peripheral_api.py``). It also has an optional PipeWire integration for volume
+control.
+
+Design goals
+------------
+* **The Jabra is a USB device**, so it can be unplugged/replugged at any time.
+  A discovery loop watches for add/remove events and recreates the HID
+  connection. The process itself never crashes on a disconnect.
+* **Every loop reconnects or retries on its own.** A single failed I/O operation
+  is logged and swallowed — it can never take down the whole process.
+* **Mute detection via audio-stream analysis was removed.** It relied on reading
+  the raw mic stream for all-zero samples, which was unreliable and janky.
+"""
+
 import asyncio
+import json
+import os
 import re
-import shutil
 import time
 import traceback
-from enum import IntFlag, Enum
+from enum import Enum, IntFlag
 
-import websockets
-import json
 import hid
-import os
-
+import websockets
 from websockets import ClientConnection
 
-# --- CONFIGURATION ---
-# Default to localhost if running on host network, or use LVA container name/IP
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+# LVA peripheral API WebSocket URL. Defaults to the host port; override when LVA
+# runs elsewhere (e.g. LVA_WS_URL=ws://lva:6055).
 LVA_WS_URL = os.getenv("LVA_WS_URL", "ws://0.0.0.0:6055")
 
-JABRA_VENDOR = 0x0b0e
-# JABRA_PRODUCT = 0x0412
+# GN Netcom / Jabra USB vendor id.
+JABRA_VENDOR = 0x0B0E
 
-starttime = time.time()
+# PipeWire sink used by volume control. Empty means "the system default sink".
+PW_SINK = os.getenv("PW_SINK", "")
 
-pw_sink = os.getenv("PW_SINK", "@DEFAULT_SINK@")
+# Volume-button behaviour:
+#   "pipewire" -> adjust the PipeWire sink directly via wpctl
+#   "lva"      -> send volume_up / volume_down commands to LVA
+#   unset/other -> ignore the volume buttons entirely
+VOL_CTRL = os.getenv("VOLUME_CONTROL", None)
+if VOL_CTRL not in ("pipewire", "lva"):
+    VOL_CTRL = None
 
-vol_ctrl = os.getenv("VOLUME_CONTROL", None)
-
-if vol_ctrl not in ["pipewire", "lva"]:
-    print("invalid volume control")
-    vol_ctrl = None
-
-print(hid.enumerate())
+# Tunables (seconds).
+READ_POLL = 0.05  # delay between HID polls while idle
+DISCOVER_INTERVAL = 1.0  # delay between USB discovery scans
+RECONNECT_DELAY = 1.0  # delay between LVA reconnect attempts
+MUTE_COOLDOWN = 1.0  # debounce for the call-button hardware quirk
 
 
-# USAGE_PAGE = 11
+# --------------------------------------------------------------------------- #
+# HID / LED / button constants
+# --------------------------------------------------------------------------- #
 
 
 class Telephony(IntFlag):
+    """Bits from the Jabra's undocumented telephony HID report."""
+
     hook_switch = 1 << 0
     line_busy_tone = 1 << 1
     speaker_phone = 1 << 2
@@ -47,7 +78,7 @@ class Telephony(IntFlag):
     phone_key_bit_1 = 1 << 8
     phone_key_bit_2 = 1 << 9
     phone_key_bit_3 = 1 << 10
-    # no clue
+    # Undocumented: fires on hang-up while the LEDs are flashing.
     button_7 = 1 << 11
 
 
@@ -58,24 +89,29 @@ class LEDs(IntFlag):
     ring = 1 << 3
     hold = 1 << 4
     microphone = 1 << 5
-    # marked telephony and not LED, probably why it's a dupe of ring
+    # Marked "telephony" upstream; duplicate of `ring`.
     ringer = 1 << 6
 
 
 class Volume(IntFlag):
-    vol_down = 1 << 0
-    vol_up = 1 << 1
-    # does this ever trigger? might be a host -> device only thing?
+    vol_up = 1 << 0
+    vol_down = 1 << 1
     mute = 1 << 2
 
 
-class LEDState(IntFlag, Enum):
+class LEDState(IntFlag):
+    """Led-ring patterns we drive. IntFlag so patterns can bit-combine."""
+
     default = 0
     three_green = LEDs.off_hook
     all_red = LEDs.mute | LEDs.off_hook
-    ringing_and_flashing = LEDs.ring
     flashing = LEDs.ring | LEDs.off_hook
     partial_flash = LEDs.hold
+
+
+# --------------------------------------------------------------------------- #
+# LVA peripheral API protocol
+# --------------------------------------------------------------------------- #
 
 
 class LVAEvent(str, Enum):
@@ -86,7 +122,8 @@ class LVAEvent(str, Enum):
     THINKING = "thinking"
     TTS_SPEAKING = "tts_speaking"
     TTS_FINISHED = "tts_finished"
-    ERROR = "error"
+    PIPELINE_ERROR = "pipeline_error"
+    DISCONNECTED = "disconnected"
     IDLE = "idle"
     MUTED = "muted"
     TIMER_TICKING = "timer_ticking"
@@ -102,207 +139,361 @@ class LVACommand(str, Enum):
     """Commands accepted from peripheral clients."""
 
     START_LISTENING = "start_listening"
-    STOP_LISTENING = "stop_listening"
+    STOP_PIPELINE = "stop_pipeline"
     MUTE_MIC = "mute_mic"
     UNMUTE_MIC = "unmute_mic"
     VOLUME_UP = "volume_up"
     VOLUME_DOWN = "volume_down"
     STOP_TIMER_RINGING = "stop_timer_ringing"
     STOP_MEDIA_PLAYER = "stop_media_player"
-    STOP_SPEAKING = "stop_speaking"
+    REGISTER_BUTTON_LOCK = "register_button_lock"
 
 
-class JabraSpeak:
-    loop: asyncio.Task
+# Sentinel returned by ``JabraHid.read`` when the device vanished. Never a real
+# event, so it is safe to compare with ``is``.
+DEVICE_GONE = object()
 
-    def __init__(self, path):
+
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
+
+
+def log(msg: str, *args) -> None:
+    if args:
+        msg = f"{msg} {' '.join(str(a) for a in args)}"
+    print(f"{time.time():.1f}s: {msg}", flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# One Jabra device + its HID read loop
+# --------------------------------------------------------------------------- #
+
+
+class JabraHid:
+    """Wraps a single USB HID Jabra device and its async read loop.
+
+    A new instance is created every time a device is (re)discovered: on Linux a
+    closed ``hid.device`` cannot be reopened, so we never reuse one.
+    """
+
+    def __init__(self, path: str, serial: str):
         self.path = path
-        self.device = hid.device()
-        self.device.open_path(self.path)
-        # we can do thread fuckery to make this work
-        self.device.set_nonblocking(True)
+        self.serial = serial
+        self.hid = hid.device()
+        self.task: asyncio.Task | None = None
 
-    def close(self):
-        if self.loop:
-            self.loop.cancel()
-        self.device.close()
+    def close(self) -> None:
+        try:
+            self.hid.close()
+        except Exception:
+            pass  # device already gone — nothing to clean up
+
+    async def write(self, state: LEDState) -> None:
+        """Send the telephony LED report to the device."""
+        await asyncio.to_thread(
+            self.hid.write,
+            [0x03, state & 0xFF, (state >> 8) & 0xFF],
+        )
 
     async def read(self):
+        """Return the next decoded event, or ``DEVICE_GONE`` if the device vanished.
+
+        Blocks (via ``asyncio.sleep``) until either a packet arrives or the device
+        is removed, so the caller never busy-loops.
+        """
         while True:
             try:
-                read_info = self.device.read(8)
-                if read_info:
-                    match read_info[0]:
-                        case 0x03:
-                            return Telephony(read_info[1] | read_info[2] << 8)
-                        case 0x01:
-                            return Volume(read_info[1])
-                        case _:
-                            print(f"{round(time.time() - starttime, 1)}s: Packet {bytelist(read_info)} of unknown type")
+                data = self.hid.read(8)
+            except Exception:
+                # Device unplugged / suspended / lost its driver — stop cleanly.
+                # (CancelledError is *not* an ``Exception`` subclass, so task
+                #  cancellation escapes here rather than being swallowed.)
+                return DEVICE_GONE
 
-                await asyncio.sleep(0.1)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                print("fatal error in jabra loop: ", e)
-                traceback.print_exc()
+            if not data:
+                await asyncio.sleep(READ_POLL)
+                continue
 
-                await asyncio.sleep(1)
+            match data[0]:
+                case 0x03:  # telephony / LED report
+                    return Telephony(data[1] | data[2] << 8)
+                case 0x01:  # volume / consumer control report
+                    return Volume(data[1])
+                case _:
+                    log("unknown HID packet", hex(data[0]))
+                    # Keep reading; an unknown packet is not fatal.
 
-    async def write(self, button_state: LEDs):
-        return await asyncio.to_thread(self.device.write, [0x03, button_state & 0xff, (button_state & 0xff00) >> 8])
-
-    async def readloop(self):
-        global last_mute, muted
-
+    async def readloop(self) -> None:
+        """Read events and dispatch them until the device is removed."""
         while True:
             event = await self.read()
-            print(f"from jabra: {event.__class__.__name__} {event.name} 0b{int(event):b}")
-            # print(f"last event: {last_jabra_write.name}")
-            if isinstance(event, Telephony):
-                if (
-                        # hangup while talking
-                        ((event & Telephony.flash) and last_jabra_write == LEDState.partial_flash)
-                        # hangup while listening
-                        or (event is None and last_jabra_write == LEDState.three_green)
-                        # hangup while flashing?? wtf is button 7????
-                        or (event & Telephony.button_7)
-                ):
-                    print("jabra to lva: hangup detected")
-                    await write_to_lva(LVACommand.STOP_TIMER_RINGING)
-                    await write_to_lva(LVACommand.STOP_SPEAKING)
-                    await write_to_lva(LVACommand.STOP_LISTENING)
-                # mute switch
-                elif event & Telephony.mute:
-                    print("jabra to lva: mute toggle detected")
-                    global muted
-                    if muted:
-                        await set_mute(False)
-                    else:
-                        await set_mute(True)
-                # call button
-                elif event & Telephony.hook_switch and last_jabra_write == LEDState.default:
-                    # damn thing fires the hook swicth when you unmUTE
-                    if off_mute_cooldown():
-                        print("jabra to lva: call button detected")
-                        # if lva is glitched and i dont update the state machine, it will absolutely crap out
-                        await write_to_jabra(LEDState.flashing)
-
-                        await write_to_lva(LVACommand.START_LISTENING)
-
-                        await asyncio.create_task(listening_bodge())
-            elif isinstance(event, Volume):
-                if not vol_ctrl:
-                    print("ignoring volume command, env not set")
-                    continue
-                if event & Volume.vol_up:
-                    print("jabra to lva: volume up detected")
-                    match vol_ctrl:
-                        case "lva":
-                            await write_to_lva(LVACommand.VOLUME_UP)
-                        case "pipewire":
-                            await wpctl_vol("10%+")
-                elif event & Volume.vol_down:
-                    print("jabra to lva: volume down detected")
-                    match vol_ctrl:
-                        case "lva":
-                            await write_to_lva(LVACommand.VOLUME_DOWN)
-                        case "pipewire":
-                            await wpctl_vol("10%-")
-                elif event & Volume.mute:
-                    print("jabra to lva: consumer control mute toggle detected")
-                    if muted:
-                        await set_mute(False)
-                        print("unmute cooldown")
-                    else:
-                        await set_mute(True)
+            if event is DEVICE_GONE:
+                log("jabra disconnected, read loop ended")
+                return
+            try:
+                await handle_event(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log("error handling jabra event")
+                traceback.print_exc()
 
 
-# fixes a bug where it can get stuck on wakework detected
-async def listening_bodge():
+# --------------------------------------------------------------------------- #
+# USB discovery manager — single source of truth for connected devices
+# --------------------------------------------------------------------------- #
+
+
+class JabraManager:
+    def __init__(self):
+        # Keyed by USB path. A path can be reused by a freshly-plugged device,
+        # which is exactly why we tear down on remove and recreate on add.
+        self.devices: dict[str, JabraHid] = {}
+
+    async def loop(self) -> None:
+        """Periodically scan for the Jabra and react to add/remove events."""
+        while True:
+            try:
+                await self.scan()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log("discovery error")
+                traceback.print_exc()
+            await asyncio.sleep(DISCOVER_INTERVAL)
+
+    async def scan(self) -> None:
+        current: dict[str, dict] = {}
+        try:
+            for info in hid.enumerate(JABRA_VENDOR):
+                current[info["path"]] = info
+        except Exception:
+            # hid.enumerate can transiently fail right after a plug. Ignore and
+            # retry on the next scan cycle.
+            log("hid.enumerate failed")
+            return
+
+        # Removed devices.
+        for path in list(self.devices):
+            if path not in current:
+                await self._teardown(path)
+
+        # Newly connected devices.
+        for path, info in current.items():
+            if path not in self.devices:
+                await self._setup(path, info)
+
+    async def _setup(self, path: str, info: dict) -> None:
+        serial = info.get("serial_number") or "unknown"
+        try:
+            dev = JabraHid(path, serial)
+        except Exception:
+            # Path was in enumerate but disappeared before we could open it.
+            log("could not open device @", path)
+            return
+        log(
+            "jabra connected",
+            info.get("product_string", ""),
+            "s/n",
+            serial,
+            "@",
+            path,
+        )
+        dev.task = asyncio.create_task(dev.readloop(), name="jabra-readloop")
+        self.devices[path] = dev
+
+    async def _teardown(self, path: str) -> None:
+        dev = self.devices.pop(path, None)
+        if dev is None:
+            return
+        log("jabra removed", "@", path)
+        if dev.task:
+            dev.task.cancel()
+            try:
+                await dev.task
+            except (asyncio.CancelledError, Exception):
+                pass  # task finished/cancelled — nothing to do
+        dev.close()
+
+
+# --------------------------------------------------------------------------- #
+# Shared controller state (mutated by both the HID and LVA loops)
+# --------------------------------------------------------------------------- #
+
+last_jabra_write: LEDState = LEDState.default
+current_state: LVAEvent | None = None
+muted: bool = False
+buttons_locked: bool = False
+lva_sock: ClientConnection | None = None
+last_mute: float = 0.0
+_disconnect_task: asyncio.Task | None = None
+
+manager = JabraManager()
+
+
+def off_mute_cooldown() -> bool:
+    """True if ``MUTE_COOLDOWN`` seconds elapsed since the last mute toggle.
+
+    The Jabra spuriously fires ``hook_switch`` right after an unmute, so the
+    call button is debounced to ignore that glitch.
+    """
+    return (time.perf_counter() - last_mute) >= MUTE_COOLDOWN
+
+
+def bump_mute_cooldown() -> None:
+    global last_mute
+    last_mute = time.perf_counter()
+
+
+async def write_to_jabra(state: LEDState) -> None:
+    global last_jabra_write
+    last_jabra_write = state
+    log("to jabra:", state.name)
+    # Write to every connected device (normally just one).
+    await asyncio.gather(*(d.write(state) for d in manager.devices.values()))
+
+
+async def write_to_lva(command: LVACommand, data: dict | None = None) -> None:
+    msg = {"command": command.value}
+    if data:
+        msg["data"] = data
+    # Physical buttons are locked from Home Assistant; don't send commands.
+    if buttons_locked:
+        log("buttons locked, ignoring", command.value)
+        return
+    if lva_sock is None:
+        log("no LVA connection, ignoring", command.value)
+        return
+    log("to lva:", command.value)
+    await lva_sock.send(json.dumps(msg))
+
+
+async def set_mute(muted_new: bool, write_lva: bool = True) -> None:
+    global muted
+    muted = muted_new
+    bump_mute_cooldown()
+    commands = [write_to_jabra(LEDState.all_red if muted_new else LEDState.default)]
+    if write_lva:
+        cmd = LVACommand.MUTE_MIC if muted_new else LVACommand.UNMUTE_MIC
+        commands.append(write_to_lva(cmd))
+    await asyncio.gather(*commands)
+
+
+async def toggle_mute() -> None:
+    await set_mute(muted)
+
+
+# --------------------------------------------------------------------------- #
+# Button event handling
+# --------------------------------------------------------------------------- #
+
+
+async def handle_event(event) -> None:
+    """Dispatch a decoded HID event: drive LEDs and send LVA commands."""
+    log("from jabra:", event.name, hex(int(event)))
+
+    if isinstance(event, Telephony):
+        await handle_telephony(event)
+    elif isinstance(event, Volume):
+        await handle_volume(event)
+
+
+async def handle_telephony(ev: Telephony) -> None:
+    # Hang-up gesture. The Jabra maps "hang up" to different bits depending on
+    # the LED state it thinks it's in, so we cover the flash-during-TTS case and
+    # the undocumented button_7 catch-all for the flashing states.
+    if (
+        (ev & Telephony.flash)
+        and last_jabra_write == LEDState.partial_flash
+        or (ev & Telephony.button_7)
+    ):
+        log("hangup detected")
+        if current_state == LVAEvent.MEDIA_PLAYER_PLAYING:
+            await write_to_lva(LVACommand.STOP_MEDIA_PLAYER)
+        else:
+            await write_to_lva(LVACommand.STOP_TIMER_RINGING)
+            await write_to_lva(LVACommand.STOP_PIPELINE)
+    # Physical mute switch.
+    elif ev & Telephony.mute:
+        log("mute toggle")
+        await toggle_mute()
+    # Call button — only valid while sitting in the default (off) LED state.
+    elif ev & Telephony.hook_switch and last_jabra_write == LEDState.default:
+        if off_mute_cooldown():
+            log("call button")
+            await write_to_jabra(LEDState.flashing)
+            await write_to_lva(LVACommand.START_LISTENING)
+            await schedule_listening_bodge()
+
+
+async def handle_volume(ev: Volume) -> None:
+    if not VOL_CTRL:
+        log("ignoring volume (VOLUME_CONTROL unset)")
+        return
+    if buttons_locked:
+        log("ignoring volume (buttons locked)")
+        return
+    if ev & Volume.vol_up:
+        log("volume up")
+        await adjust_volume(+1)
+    elif ev & Volume.vol_down:
+        log("volume down")
+        await adjust_volume(-1)
+    elif ev & Volume.mute:
+        log("consumer mute toggle")
+        await toggle_mute()
+
+
+async def adjust_volume(delta: int) -> None:
+    if VOL_CTRL == "lva":
+        await write_to_lva(
+            LVACommand.VOLUME_UP if delta > 0 else LVACommand.VOLUME_DOWN
+        )
+    else:  # pipewire
+        await wpctl(f"{'+' if delta > 0 else '-'}10%")
+
+
+async def schedule_listening_bodge() -> None:
+    """Recover from a stuck "wake word detected" state."""
     await asyncio.sleep(0.5)
     if current_state == LVAEvent.WAKE_WORD_DETECTED:
-        await write_to_lva(LVACommand.STOP_LISTENING)
+        await write_to_lva(LVACommand.STOP_PIPELINE)
         await write_to_jabra(LEDState.three_green)
 
 
-last_jabra_write: LEDs | LEDState = LEDState.default
-last_lva_write: LVACommand | None = None
-
-device_paths = {}
-devices: dict[str, JabraSpeak] = {}
+# --------------------------------------------------------------------------- #
+# LED animations for LVA error / disconnect states
+# --------------------------------------------------------------------------- #
 
 
-def discover(tg: asyncio.TaskGroup):
-    global devices, device_paths
-    new_device_paths = {}
-    for device in hid.enumerate(JABRA_VENDOR):
-        # serial = device['serial_number']
-        # print(f"Found {device['product_string']} serial number: {serial}")
-        new_device_paths[device['path']] = device
-
-    if len(new_device_paths) == 0:
-        # print("NO JABRA ALERT WAAAAA")
-        print("no jabra speak found!")
-    for path, device in device_paths.items():
-        if path not in new_device_paths:
-            print(f"Device removed: {device['product_string']} s/n {device['serial_number']} @ {path}")
-            devices[path].close()
-            del devices[path]
-    for path, device in new_device_paths.items():
-        if path not in device_paths:
-            print(f"New device: {device['product_string']} s/n {device['serial_number']} @ {path} ")
-            devices[path] = JabraSpeak(path)
-            devices[path].loop = tg.create_task(devices[path].readloop())
-    device_paths = new_device_paths
+async def _blink_task(interval: float, on: LEDState, off: LEDState) -> None:
+    try:
+        while True:
+            await write_to_jabra(on)
+            await asyncio.sleep(interval)
+            await write_to_jabra(off)
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log("blink task error")
+        traceback.print_exc()
 
 
-last_mute = 0
+async def start_disconnect_blink() -> None:
+    """Blink red to signal LVA/HA is unreachable. Runs until reconnected."""
+    global _disconnect_task
+    log("LVA disconnected — blinking red")
+    if _disconnect_task is not None:
+        _disconnect_task.cancel()
+    _disconnect_task = asyncio.create_task(
+        _blink_task(0.5, LEDState.all_red, LEDState.default)
+    )
 
 
-def bytelist(l: list[int]):
-    return "[" + ', '.join(f"0x{b:02x}" for b in l) + "]"
-
-
-async def write_to_jabra(state: LEDs | LEDState):
-    print(f"to jabra: {state.name} {int(state):b}")
-    global last_jabra_write
-    last_jabra_write = state
-    return await asyncio.gather(*[d.write(state) for d in devices.values()])
-
-
-async def write_to_lva(command: LVACommand, data: dict = None):
-    if lva_sock:
-        global last_lva_write
-        last_lva_write = command
-        message = json.dumps({"command": command} | ({"data": data} if data else {}))
-        print(f"to lva: {message}")
-        await lva_sock.send(message)
-    else:
-        print("to lva: failed, no websocket")
-
-
-lva_sock: None | ClientConnection = None
-
-
-async def set_mute(m: bool, write_lva: bool = True):
-    global muted, last_mute
-    muted = m
-    mute_cooldown()
-    if m:
-        commands = ([write_to_jabra(LEDState.all_red)] +
-                    ([write_to_lva(LVACommand.MUTE_MIC)] if write_lva else []))
-
-        await asyncio.gather(*commands)
-
-    else:
-        commands = ([write_to_jabra(LEDState.default)] +
-                    ([write_to_lva(LVACommand.UNMUTE_MIC)] if write_lva else []))
-
-        await asyncio.gather(*commands)
-
-
-async def cool_error():
+async def start_pipeline_error_flash() -> None:
+    """Brief 4× red flash, then return to default."""
     for _ in range(4):
         await write_to_jabra(LEDState.all_red)
         await asyncio.sleep(0.1)
@@ -310,191 +501,159 @@ async def cool_error():
         await asyncio.sleep(0.1)
 
 
-current_state: None | LVAEvent = None
+async def cancel_blink_on_reconnect() -> None:
+    """Clear the disconnect blink once LVA reports a live state again."""
+    global _disconnect_task
+    if _disconnect_task is not None:
+        _disconnect_task.cancel()
+        _disconnect_task = None
 
-muted: bool = False
+
+# --------------------------------------------------------------------------- #
+# LVA WebSocket client
+# --------------------------------------------------------------------------- #
 
 
-async def run_cmd(cmd: list[str]):
-    print("run_cmd ", cmd)
+# LVA state -> LED ring pattern (states that have a persistent visual).
+_LED_FOR_EVENT = {
+    LVAEvent.WAKE_WORD_DETECTED: LEDState.flashing,
+    LVAEvent.LISTENING: LEDState.three_green,
+    LVAEvent.THINKING: LEDState.flashing,
+    LVAEvent.TTS_SPEAKING: LEDState.partial_flash,
+    LVAEvent.TTS_FINISHED: LEDState.default,
+    LVAEvent.TIMER_RINGING: LEDState.flashing,
+}
 
+
+async def handle_lva_message(raw: str) -> None:
+    global buttons_locked, current_state
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        log("bad LVA message")
+        return
+
+    event = msg.get("event")
+
+    # On (re)connect LVA pushes a snapshot with our persisted mute + lock state.
+    if event == "snapshot":
+        data = msg.get("data", {})
+        buttons_locked = bool(data.get("button_controls_locked", False))
+        if data.get("muted"):
+            await set_mute(True, write_lva=False)
+        return
+
+    if event == "button_lock_changed":
+        buttons_locked = bool(msg.get("data", {}).get("locked", False))
+        log("button controls", "locked" if buttons_locked else "unlocked")
+        return
+
+    try:
+        state = LVAEvent(event)
+    except ValueError:
+        log("unknown LVA event", event)
+        return
+
+    current_state = state
+
+    if state == LVAEvent.DISCONNECTED:
+        await start_disconnect_blink()
+    else:
+        await cancel_blink_on_reconnect()
+        if state == LVAEvent.PIPELINE_ERROR:
+            await start_pipeline_error_flash()
+        elif state == LVAEvent.IDLE:
+            await set_mute(False, write_lva=False)
+        elif state == LVAEvent.MUTED:
+            await set_mute(True, write_lva=False)
+        else:
+            led = _LED_FOR_EVENT.get(state)
+            if led is not None:
+                await write_to_jabra(led)
+
+
+async def wsloop() -> None:
+    global lva_sock
+    while True:
+        try:
+            async with websockets.connect(LVA_WS_URL) as ws:
+                lva_sock = ws
+                log("connected to LVA at", LVA_WS_URL)
+                # Declare button-lock support. LVA reflects the saved lock state
+                # back to us in the snapshot, so no extra state is needed.
+                await ws.send(json.dumps({"command": "register_button_lock"}))
+                async for raw in ws:
+                    await handle_lva_message(raw)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log("LVA loop error, reconnecting")
+            traceback.print_exc()
+            lva_sock = None
+            await asyncio.sleep(RECONNECT_DELAY)
+
+
+# --------------------------------------------------------------------------- #
+# PipeWire volume control
+# --------------------------------------------------------------------------- #
+
+
+async def run_cmd(cmd: list[str]) -> tuple[str, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         stdin=asyncio.subprocess.DEVNULL,
     )
-
     stdout, stderr = await proc.communicate()
-
     try:
         stdout = stdout.decode().strip()
         stderr = stderr.decode().strip()
     except UnicodeDecodeError:
-        stdout = stdout.decode("ascii", 'ignore').strip()
-        stderr = stderr.decode("ascii", 'ignore').strip()
-
+        stdout = stdout.decode("ascii", "ignore").strip()
+        stderr = stderr.decode("ascii", "ignore").strip()
     if proc.returncode != 0:
-        raise Exception("wpctl failed ", cmd, stdout, stderr)
-    else:
-        return stdout, stderr
+        raise RuntimeError("command failed", cmd, stdout, stderr)
+    return stdout, stderr
 
 
-async def wpctl_vol(vol_mod: str):
-    await run_cmd(["wpctl", "set-volume", "-l", "1.0", pw_sink, vol_mod])
-
-    vol = await pw_vol()
-    if vol <= 0:
-        await run_cmd(["wpctl", "set-mute", pw_sink, "1"])
-    else:
-        await run_cmd(["wpctl", "set-mute", pw_sink, "0"])
-
-
-async def wsloop():
-    global lva_sock
-    while True:
-        try:
-            async with websockets.connect(LVA_WS_URL) as websocket:
-                print(f"Connected to LVA at {LVA_WS_URL}")
-                lva_sock = websocket
-                while True:
-                    data = await websocket.recv()
-                    print(f"from lva: {data}")
-                    json_data = json.loads(data)
-                    if json_data["event"] == "snapshot":
-                        await set_mute(json_data["data"]["muted"], write_lva=False)
-                    global current_state
-                    try:
-                        current_state = LVAEvent(json_data["event"])
-                    except ValueError:
-                        print(f"current state is not a valid event: {json_data['event']}")
-                    match current_state:
-                        case LVAEvent.WAKE_WORD_DETECTED:
-                            await write_to_jabra(LEDState.flashing)
-                        case LVAEvent.LISTENING:
-                            await write_to_jabra(LEDState.three_green)
-                        case LVAEvent.THINKING:
-                            await write_to_jabra(LEDState.flashing)
-                        case LVAEvent.TTS_SPEAKING:
-                            await write_to_jabra(LEDState.partial_flash)
-                        case LVAEvent.TTS_FINISHED:
-                            await write_to_jabra(LEDState.default)
-                        case LVAEvent.ERROR:
-                            asyncio.create_task(cool_error())
-                        case LVAEvent.IDLE:
-                            await set_mute(False, write_lva=False)
-                        case LVAEvent.MUTED:
-                            await set_mute(True, write_lva=False)
-                        case LVAEvent.TIMER_TICKING:
-                            pass
-                        case LVAEvent.TIMER_UPDATED:
-                            pass
-                        case LVAEvent.TIMER_RINGING:
-                            await write_to_jabra(LEDState.flashing)
-                        case LVAEvent.MEDIA_PLAYER_PLAYING:
-                            pass
-                        case LVAEvent.VOLUME_CHANGED:
-                            pass
-                        case LVAEvent.VOLUME_MUTED:
-                            pass
-                        case LVAEvent.ZEROCONF:
-                            pass
-                        case event:
-                            print(f"Unknown event: {event}")
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print("fatal error in lva loop: ", e)
-            traceback.print_exc()
-            lva_sock = None
-            await asyncio.sleep(1)
-
-
-async def pw_vol():
-    stdout, stderr = await run_cmd(["wpctl", "get-volume", pw_sink])
-
-    # Extract the float value
-    match = re.search(r'Volume:\s*([0-9.]+)', stdout)
-    return float(match.group(1))  # Returns exactly 0.5
-
-
-def off_mute_cooldown():
-    global last_mute
-    ret = time.perf_counter() - last_mute >= 1
-    print("off mute cooldown: ", ret)
-    return ret
-
-
-def mute_cooldown():
-    global last_mute
-    print("set mute cooldown")
-    last_mute = time.perf_counter()
-
-
-async def mute_detect_bodge():
-    if shutil.which("pw-record") is None:
-        print("pw-record not found. make sure wireplumber is installed.")
+async def wpctl(mod: str) -> None:
+    """Adjust the PipeWire sink volume by ``mod`` (e.g. "+10%"), then mute-unmute
+    based on the resulting volume so volume 0 maps to hardware mute."""
+    try:
+        await run_cmd(["wpctl", "set-volume", "-l", "1.0", PW_SINK, mod])
+    except Exception:
+        log("wpctl set-volume failed")
         return
-    while True:
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "pw-record", "--rate", "16000", "--channels", "1", "--format", "s16", "-",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL
-            )
-            while True:
-                rate = 16_000
-                read_dur = 0.2
-                chunk = await proc.stdout.readexactly(int(rate * read_dur))
-                global muted, last_mute
-                # all zeroes, mic has been muted
-                if not any(chunk) and not muted and off_mute_cooldown():
-                    await set_mute(True)
-                if any(chunk) and muted and off_mute_cooldown():
-                    await set_mute(False)
+    try:
+        vol, _ = await run_cmd(["wpctl", "get-volume", PW_SINK])
+    except Exception:
+        return
+    match = re.search(r"Volume:\s*([0-9.]+)", vol)
+    if not match:
+        return
+    if float(match.group(1)) <= 0:
+        await run_cmd(["wpctl", "set-mute", PW_SINK, "1"])
+    else:
+        await run_cmd(["wpctl", "set-mute", PW_SINK, "0"])
 
 
-        except asyncio.CancelledError:
-            raise
-        except asyncio.IncompleteReadError as e:
-            # This happens when pw-record is killed while waiting for data. Just exit the loop and respawn it.
-            print("pw-record process ended ", e)
-            print(await proc.communicate())
-            print(proc.returncode)
-        except Exception as e:
-            if proc:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-            print("fatal error in mute_detect_bodge: ", e)
-            traceback.print_exc()
-            await asyncio.sleep(1)
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
 
 
-async def discover_loop(tg: asyncio.TaskGroup):
-    while True:
-        try:
-            discover(tg)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print("fatal exception in discover loop ", e, str(e.__traceback__))
-            traceback.print_exc()
-        await asyncio.sleep(1)
-
-
-async def main():
+async def main() -> None:
     async with asyncio.TaskGroup() as tg:
-        # Spawn your infinite loops here
-        tg.create_task(discover_loop(tg))
+        # Each loop is self-healing: discovery manages USB, wsloop manages LVA.
+        tg.create_task(manager.loop())
         tg.create_task(wsloop())
-        tg.create_task(mute_detect_bodge())
-
-        # await asyncio.sleep(0.5)
-        # await write_to_jabra(LEDs.microphone | LEDs.speaker)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except asyncio.CancelledError:
+        pass  # clean shutdown (SIGINT/SIGTERM)
+    except Exception:
+        traceback.print_exc()
