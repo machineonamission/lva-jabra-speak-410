@@ -1,8 +1,7 @@
 [Container]
-# container stuff
 ContainerName=jabra
 Image=ghcr.io/machineonamission/lva-jabra-speak-410:main
-# auto update
+
 AutoUpdate=registry
 Pull=newer
 
@@ -15,3 +14,24 @@ SecurityLabelDisable=true
 GroupAdd=audio
 Environment=XDG_RUNTIME_DIR=/run/pipewire
 Environment=PULSE_SERVER=unix:/run/pipewire/pulse/native
+
+# volume control (see README)
+Environment=VOLUME_CONTROL=pipewire
+
+# Native Healthchecks — restart if the process hangs. The base image has no
+# pgrep, so we scan /proc for our own process (excluding this check's PID, whose
+# -c payload also contains the string "main.py").
+HealthCmd=python3 -c "import os;me=os.getpid();exit(0 if any(b'main.py' in open('/proc/%s/cmdline'%d,'rb').read() and d!=str(me) for d in os.listdir('/proc') if d.isdigit()) else 1)"
+HealthInterval=60s
+HealthTimeout=15s
+HealthRetries=3
+HealthStartupRetries=60
+HealthStartupInterval=5s
+
+[Service]
+Restart=always
+RestartMaxDelay=30s
+
+[Unit]
+After=linux-voice-assistant.container
+Wants=linux-voice-assistant.container
